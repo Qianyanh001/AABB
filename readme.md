@@ -1,6 +1,6 @@
 # ABCD Project
 ## 1. 环境配置 (Environment Setup)
-本项目基于 Python 3.10+ 和 PyTorch 2.1+ (CUDA 12.1)。
+本项目基于 Python 3.10+ 和 PyTorch 2.4 (CUDA 12.1)。
 ### 1.1 创建虚拟环境
 请确保项目根目录下已存在 `environment.yml` 和 `requirements.txt` 文件。
 ```bash
