@@ -1,4 +1,4 @@
-name: face_dstill
+name: face_distill
 channels:
   - defaults
 dependencies:
