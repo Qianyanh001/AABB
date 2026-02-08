@@ -40,7 +40,7 @@ pip install -r requirements.txt
 ### **推荐的文件结构**
 ```text
 [Project Root]/
-├── train_distill.py       # 主训练脚本
+├── train_distill_face.py       # 主训练脚本
 ├── download_weight.py     # 权重下载脚本
 ├── FaceDataset.py         # 数据集加载类
 ├── environment.yml        # Conda 环境配置
@@ -60,14 +60,14 @@ pip install -r requirements.txt
 脚本支持自动检测多卡，默认使用所有可见 GPU。您可以通过 `GPU_LIST` 环境变量控制使用的显卡。
 **基本运行命令**:
 ```bash
-python train_distill.py
+python train_distill_face.py
 ```
 **指定显卡运行** (例如使用 GPU 0 和 1):
 Windows PowerShell:
 ```powershell
-$env:GPU_LIST="0,1"; python train_distill.py
+$env:GPU_LIST="0,1"; python train_distill_face.py
 ```
-或者直接修改 `train_distill.py` 中的 `GPU_LIST` 默认值。
+或者直接修改 `train_distill_face.py` 中的 `GPU_LIST` 默认值。
 ### 3.2 训练参数配置
 主要参数在 `train_distill.py` 中定义。请根据硬件显存情况调整：
 | 参数 | 默认值 | 说明 |
