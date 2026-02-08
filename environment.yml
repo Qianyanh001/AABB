@@ -1,9 +1,8 @@
-name: mtb
+name: face_dstill
 channels:
   - defaults
 dependencies:
   - cudatoolkit=11.8
   - python=3.10
   - mxnet
-prefix: /usr/local/anaconda3/envs/mtb
 
