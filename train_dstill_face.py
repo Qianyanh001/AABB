@@ -175,7 +175,7 @@ if __name__ == "__main__":
     teacher_feat_dir = os.path.join(project_root, "teacher_features_12k")
     log_dir = os.path.join(project_root, "logs", "adapter_distill")
     
-    per_gpu_batch = 32
+    per_gpu_batch = 64
     batch_size = per_gpu_batch * max(1, logical_gpu_count)
     lr = 1e-4
     epochs = 100
