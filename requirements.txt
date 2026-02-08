@@ -81,3 +81,4 @@ typing_extensions==4.15.0
 tzdata==2025.3
 urllib3 @ file:///home/conda/feedstock_root/build_artifacts/urllib3_1767817748113/work
 Werkzeug==3.1.5
+mxnet
