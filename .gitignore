@@ -1,0 +1,7 @@
+__pycache__/
+blip2_weights
+datasets
+my_task.sh
+sharing
+logs
+checkpoints
