@@ -171,7 +171,7 @@ if __name__ == "__main__":
 
     project_root = os.path.dirname(os.path.abspath(__file__))
     blip_path = os.path.join(project_root, "blip2_weights")
-    data_root = "/media/Storage1/qyh/datasets/faces_emore/"
+    data_root = "./datasets/faces_emore/"
     teacher_feat_dir = os.path.join(project_root, "teacher_features_12k")
     log_dir = os.path.join(project_root, "logs", "adapter_distill")
     
