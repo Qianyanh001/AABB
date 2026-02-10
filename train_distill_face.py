@@ -2,7 +2,7 @@
 import os
 
 # ==========================================================
-# 0. 环境与 GPU 配置
+# 0. 环境与 GPU 配置 (严格执行你的多卡逻辑)
 # ==========================================================
 GPU_LIST = os.environ.get("GPU_LIST", "0,1,2,3") 
 os.environ["CUDA_VISIBLE_DEVICES"] = GPU_LIST
@@ -29,7 +29,7 @@ except ImportError:
     raise ImportError("❌ FaceDataset.py not found.")
 
 # ==========================================
-# 2. 损失函数定义
+# 2. 核心损失函数定义
 # ==========================================
 class ArcFaceLoss(nn.Module):
     def __init__(self, in_features, out_features, s=64.0, m=0.5):
@@ -52,20 +52,25 @@ class ArcFaceLoss(nn.Module):
         output *= self.s
         return F.cross_entropy(output, label)
 
-class ATKLLoss(nn.Module):
-    def __init__(self, temp=1.0):
+class SpatialCosineLoss(nn.Module):
+    """
+    让 ViT 注重的东西和 CNN 一样。
+    使用余弦相似度对齐空间分布，解决 ViT 和 CNN 注意力数值分布完全不同的问题。
+    """
+    def __init__(self):
         super().__init__()
-        self.temp = temp
-        self.kl = nn.KLDivLoss(reduction="batchmean")
+        self.cosine = nn.CosineSimilarity(dim=1)
 
     def forward(self, s_map, t_prob):
         bsz, n, _ = s_map.shape
-        hw = int(math.sqrt(n))
-        att_s = torch.sum(torch.pow(s_map, 2), dim=2).view(bsz, hw, hw).unsqueeze(1)
-        att_s_resized = F.interpolate(att_s, size=(7, 7), mode="bilinear", align_corners=False)
-        att_s_vec = att_s_resized.view(bsz, -1)
-        log_prob_s = F.log_softmax(att_s_vec / self.temp, dim=1)
-        return self.kl(log_prob_s, t_prob)
+        hw = int(math.sqrt(n)) # 14
+        # 1. 提取学生特征能量图 [B, 1, 14, 14]
+        att_s = torch.norm(s_map, p=2, dim=2).view(bsz, 1, hw, hw)
+        # 2. 下采样到 7x7
+        att_s_resized = F.interpolate(att_s, size=(7, 7), mode="bilinear", align_corners=False).view(bsz, -1)
+        # 3. 计算 1 - CosineSimilarity (越接近1越好)
+        t_vec = t_prob.view(bsz, -1)
+        return (1.0 - self.cosine(att_s_resized, t_vec)).mean()
 
 class RKDLoss(nn.Module):
     def __init__(self):
@@ -90,7 +95,7 @@ class RKDLoss(nn.Module):
         return self.huber(d_s_norm, d_t_norm)
 
 # ==========================================
-# 3. 模型定义
+# 3. 模型定义 (保持原有样子)
 # ==========================================
 class FaceAdapter(nn.Module):
     def __init__(self, embed_dim, bottleneck_dim, scale=0.1):
@@ -101,7 +106,6 @@ class FaceAdapter(nn.Module):
         self.scale = nn.Parameter(torch.tensor(scale))
         nn.init.zeros_(self.up_proj.weight)
         nn.init.zeros_(self.up_proj.bias)
-
     def forward(self, x):
         return self.scale * self.up_proj(self.act(self.down_proj(x)))
 
@@ -164,8 +168,9 @@ class DatasetWithIndex(FaceDataset):
 if __name__ == "__main__":
     assert torch.cuda.is_available(), "❌ CUDA 不可用"
 
+    # 多卡逻辑：根据环境变量动态计算显卡数量
     logical_gpu_count = torch.cuda.device_count()
-    device = torch.device("cuda:0")
+    device = torch.device("cuda:0") # 这里的 cuda:0 始终指向 visible list 里的第一张
     device_ids = list(range(logical_gpu_count))
     use_dp = logical_gpu_count > 1
 
@@ -178,7 +183,7 @@ if __name__ == "__main__":
     per_gpu_batch = 128
     batch_size = per_gpu_batch * max(1, logical_gpu_count)
     lr = 1e-4
-    epochs = 100
+    epochs = 200 # 修改为 200
     num_classes = 600
 
     os.makedirs(log_dir, exist_ok=True)
@@ -198,21 +203,23 @@ if __name__ == "__main__":
 
     train_params = student.module.trainable_params if use_dp else student.trainable_params
     optimizer = optim.AdamW(train_params, lr=lr, weight_decay=1e-4)
+    # 调度器：CosineAnnealingLR
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    loss_at_fn = ATKLLoss(temp=1.0).to(device)
+    # 损失函数
+    loss_at_fn = SpatialCosineLoss().to(device)
     loss_rkd_fn = RKDLoss().to(device)
     scaler = torch.cuda.amp.GradScaler()
 
     best_loss = float('inf')
     global_step = 0
 
-    print(f"🚀 启动训练 | BatchSize: {batch_size} | 显卡: {GPU_LIST}")
+    print(f"🚀 启动训练 | Batch: {batch_size} | 逻辑显卡数: {logical_gpu_count} | GPU_LIST: {GPU_LIST}")
 
     for epoch in range(epochs):
         student.train()
         
-        # --- 关键修改：增加子损失的累加器 ---
+        # 记录三个子损失
         epoch_loss_total = 0.0
         epoch_loss_arc = 0.0
         epoch_loss_at = 0.0
@@ -221,7 +228,8 @@ if __name__ == "__main__":
         
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}")
 
-        curr_lambda_at = min(1.0, 0.1 * (epoch + 1))
+        # 动态权重：AT权重适当调高以对齐注意力
+        curr_lambda_at = min(10.0, 1 * (epoch + 1))
         curr_lambda_rkd = min(1000.0, 100 * (epoch + 1))
 
         for imgs, labels, indices in pbar:
@@ -235,18 +243,17 @@ if __name__ == "__main__":
                 s_emb, s_tokens, l_arc = student(imgs, labels)
                 if use_dp: l_arc = l_arc.mean()
                 
-                # 蒸馏损失
+                # 计算三个损失
                 l_at = loss_at_fn(s_tokens.float(), batch_t_map.float())
                 l_rkd = loss_rkd_fn(s_emb.float(), batch_t_emb.float())
                 
-                # 总损失
                 loss = l_arc + curr_lambda_at * l_at + curr_lambda_rkd * l_rkd
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
-            # --- 累加各项损失 ---
+            # 累加记录
             epoch_loss_total += loss.item()
             epoch_loss_arc += l_arc.item()
             epoch_loss_at += l_at.item()
@@ -255,12 +262,12 @@ if __name__ == "__main__":
             global_step += 1
 
             pbar.set_postfix({
-                "Loss": f"{loss.item():.2f}",
                 "Arc": f"{l_arc.item():.2f}",
-                "AT": f"{l_at.item():.4f}"
+                "AT": f"{l_at.item():.4f}",
+                "RKD": f"{l_rkd.item():.4f}"
             })
 
-        # --- Epoch 结束：输出详细的平均损失 ---
+        # Epoch结束：输出三个损失
         avg_loss = epoch_loss_total / step_count
         avg_arc = epoch_loss_arc / step_count
         avg_at = epoch_loss_at / step_count
@@ -269,19 +276,16 @@ if __name__ == "__main__":
         print(f"📊 Epoch {epoch+1} Summary:")
         print(f"   >> Avg Total Loss: {avg_loss:.4f}")
         print(f"   >> Avg ArcFace Loss: {avg_arc:.4f}")
-        print(f"   >> Avg AT Loss: {avg_at:.4f} (scaled: {avg_at * curr_lambda_at:.4f})")
-        print(f"   >> Avg RKD Loss: {avg_rkd:.4f} (scaled: {avg_rkd * curr_lambda_rkd:.4f})")
+        print(f"   >> Avg Attention Loss: {avg_at:.4f}")
+        print(f"   >> Avg RKD Loss: {avg_rkd:.4f}")
 
-        # 保存最优模型
         if avg_loss < best_loss:
-            print(f"⭐ New Best! ({best_loss:.4f} -> {avg_loss:.4f}). Saving...")
             best_loss = avg_loss
             ckpt_path = "checkpoints/best_student_adapter.pth"
             save_dict = {
                 'epoch': epoch + 1,
                 'model_state_dict': student.module.state_dict() if use_dp else student.state_dict(),
                 'loss': best_loss,
-                'sub_losses': {'arc': avg_arc, 'at': avg_at, 'rkd': avg_rkd}
             }
             torch.save(save_dict, ckpt_path)
 
@@ -289,3 +293,4 @@ if __name__ == "__main__":
         torch.cuda.empty_cache()
 
     writer.close()
+    print("✅ 训练完成！")
