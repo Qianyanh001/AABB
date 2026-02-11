@@ -2,7 +2,7 @@
 import os
 
 # ==========================================================
-# 0. 环境与 GPU 配置 (严格执行你的多卡逻辑)
+# 0. 环境与 GPU 配置
 # ==========================================================
 GPU_LIST = os.environ.get("GPU_LIST", "0,1,2,3") 
 os.environ["CUDA_VISIBLE_DEVICES"] = GPU_LIST
@@ -52,25 +52,31 @@ class ArcFaceLoss(nn.Module):
         output *= self.s
         return F.cross_entropy(output, label)
 
-class SpatialCosineLoss(nn.Module):
-    """
-    让 ViT 注重的东西和 CNN 一样。
-    使用余弦相似度对齐空间分布，解决 ViT 和 CNN 注意力数值分布完全不同的问题。
-    """
-    def __init__(self):
+class RobustKLAlignmentLoss(nn.Module):
+    def __init__(self, student_size=16, temp=4.0):
         super().__init__()
-        self.cosine = nn.CosineSimilarity(dim=1)
+        self.s_h = student_size
+        self.temp = temp
+        self.kl = nn.KLDivLoss(reduction="batchmean")
 
-    def forward(self, s_map, t_prob):
-        bsz, n, _ = s_map.shape
-        hw = int(math.sqrt(n)) # 14
-        # 1. 提取学生特征能量图 [B, 1, 14, 14]
-        att_s = torch.norm(s_map, p=2, dim=2).view(bsz, 1, hw, hw)
-        # 2. 下采样到 7x7
-        att_s_resized = F.interpolate(att_s, size=(7, 7), mode="bilinear", align_corners=False).view(bsz, -1)
-        # 3. 计算 1 - CosineSimilarity (越接近1越好)
-        t_vec = t_prob.view(bsz, -1)
-        return (1.0 - self.cosine(att_s_resized, t_vec)).mean()
+    def forward(self, s_tokens, t_prob_flat):
+        bsz = s_tokens.shape[0]
+        t_map = t_prob_flat.view(bsz, 1, 7, 7)
+        with torch.no_grad():
+            t_map_highres = F.interpolate(t_map, size=(self.s_h, self.s_h), mode='bilinear', align_corners=False)
+        s_map = torch.norm(s_tokens, p=2, dim=2).view(bsz, 1, self.s_h, self.s_h)
+
+        def min_max_norm(x):
+            flat = x.view(bsz, -1)
+            min_v = flat.min(1, keepdim=True)[0].view(bsz, 1, 1, 1)
+            max_v = flat.max(1, keepdim=True)[0].view(bsz, 1, 1, 1)
+            return (x - min_v) / (max_v - min_v + 1e-6)
+
+        s_norm = min_max_norm(s_map)
+        t_norm = min_max_norm(t_map_highres)
+        log_prob_s = F.log_softmax(s_norm.view(bsz, -1) / self.temp, dim=1)
+        prob_t = F.softmax(t_norm.view(bsz, -1) / self.temp, dim=1)
+        return self.kl(log_prob_s, prob_t)
 
 class RKDLoss(nn.Module):
     def __init__(self):
@@ -95,7 +101,7 @@ class RKDLoss(nn.Module):
         return self.huber(d_s_norm, d_t_norm)
 
 # ==========================================
-# 3. 模型定义 (保持原有样子)
+# 3. 模型定义
 # ==========================================
 class FaceAdapter(nn.Module):
     def __init__(self, embed_dim, bottleneck_dim, scale=0.1):
@@ -166,11 +172,13 @@ class DatasetWithIndex(FaceDataset):
 # 4. 主训练流程
 # ==========================================
 if __name__ == "__main__":
-    assert torch.cuda.is_available(), "❌ CUDA 不可用"
+    # --- 强行创建 checkpoints 目录 ---
+    checkpoint_dir = "checkpoints"
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # 多卡逻辑：根据环境变量动态计算显卡数量
     logical_gpu_count = torch.cuda.device_count()
-    device = torch.device("cuda:0") # 这里的 cuda:0 始终指向 visible list 里的第一张
+    device = torch.device("cuda:0")
     device_ids = list(range(logical_gpu_count))
     use_dp = logical_gpu_count > 1
 
@@ -183,11 +191,10 @@ if __name__ == "__main__":
     per_gpu_batch = 128
     batch_size = per_gpu_batch * max(1, logical_gpu_count)
     lr = 1e-4
-    epochs = 200 # 修改为 200
+    epochs = 200
     num_classes = 600
 
     os.makedirs(log_dir, exist_ok=True)
-    os.makedirs("checkpoints", exist_ok=True)
     writer = SummaryWriter(log_dir=log_dir)
 
     print("⏳ Loading Teacher Features...")
@@ -203,34 +210,25 @@ if __name__ == "__main__":
 
     train_params = student.module.trainable_params if use_dp else student.trainable_params
     optimizer = optim.AdamW(train_params, lr=lr, weight_decay=1e-4)
-    # 调度器：CosineAnnealingLR
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    # 损失函数
-    loss_at_fn = SpatialCosineLoss().to(device)
+    loss_at_fn = RobustKLAlignmentLoss(student_size=16, temp=4.0).to(device)
     loss_rkd_fn = RKDLoss().to(device)
     scaler = torch.cuda.amp.GradScaler()
 
     best_loss = float('inf')
-    global_step = 0
 
-    print(f"🚀 启动训练 | Batch: {batch_size} | 逻辑显卡数: {logical_gpu_count} | GPU_LIST: {GPU_LIST}")
+    print(f"🚀 启动训练 | Batch: {batch_size} | 显卡数: {logical_gpu_count}")
 
     for epoch in range(epochs):
         student.train()
-        
-        # 记录三个子损失
-        epoch_loss_total = 0.0
-        epoch_loss_arc = 0.0
-        epoch_loss_at = 0.0
-        epoch_loss_rkd = 0.0
+        # 记录四个损失值：Total, Arc, AT, RKD
+        epoch_loss_total, epoch_loss_arc, epoch_loss_at, epoch_loss_rkd = 0.0, 0.0, 0.0, 0.0
         step_count = 0
         
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}")
-
-        # 动态权重：AT权重适当调高以对齐注意力
-        curr_lambda_at = min(10.0, 1 * (epoch + 1))
-        curr_lambda_rkd = min(1000.0, 100 * (epoch + 1))
+        curr_lambda_at = 3000.0 * min(1.0, (epoch + 1) / 10.0) 
+        curr_lambda_rkd = 2000.0 * min(1.0, (epoch + 1) / 10.0)
 
         for imgs, labels, indices in pbar:
             imgs, labels = imgs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
@@ -238,12 +236,10 @@ if __name__ == "__main__":
             batch_t_map = t_feat_maps[indices].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-
             with torch.cuda.amp.autocast(dtype=torch.float16):
                 s_emb, s_tokens, l_arc = student(imgs, labels)
                 if use_dp: l_arc = l_arc.mean()
                 
-                # 计算三个损失
                 l_at = loss_at_fn(s_tokens.float(), batch_t_map.float())
                 l_rkd = loss_rkd_fn(s_emb.float(), batch_t_emb.float())
                 
@@ -253,41 +249,47 @@ if __name__ == "__main__":
             scaler.step(optimizer)
             scaler.update()
 
-            # 累加记录
             epoch_loss_total += loss.item()
             epoch_loss_arc += l_arc.item()
             epoch_loss_at += l_at.item()
             epoch_loss_rkd += l_rkd.item()
             step_count += 1
-            global_step += 1
 
-            pbar.set_postfix({
-                "Arc": f"{l_arc.item():.2f}",
-                "AT": f"{l_at.item():.4f}",
-                "RKD": f"{l_rkd.item():.4f}"
-            })
+            pbar.set_postfix({"Arc": f"{l_arc.item():.2f}", "AT": f"{l_at.item():.4f}", "RKD": f"{l_rkd.item():.4f}"})
 
-        # Epoch结束：输出三个损失
-        avg_loss = epoch_loss_total / step_count
+        # --- Epoch 总结：输出所有损失 ---
+        avg_total = epoch_loss_total / step_count
         avg_arc = epoch_loss_arc / step_count
         avg_at = epoch_loss_at / step_count
         avg_rkd = epoch_loss_rkd / step_count
         
         print(f"📊 Epoch {epoch+1} Summary:")
-        print(f"   >> Avg Total Loss: {avg_loss:.4f}")
+        print(f"   >> Avg Total Loss: {avg_total:.4f}")
         print(f"   >> Avg ArcFace Loss: {avg_arc:.4f}")
-        print(f"   >> Avg Attention Loss: {avg_at:.4f}")
-        print(f"   >> Avg RKD Loss: {avg_rkd:.4f}")
+        print(f"   >> Avg AT Loss: {avg_at:.4f} (scaled: {avg_at * curr_lambda_at:.2f})")
+        print(f"   >> Avg RKD Loss: {avg_rkd:.4f} (scaled: {avg_rkd * curr_lambda_rkd:.2f})")
 
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            ckpt_path = "checkpoints/best_student_adapter.pth"
-            save_dict = {
+        # --- 保存逻辑 ---
+        # 1. 保存最优模型
+        if avg_total < best_loss:
+            best_loss = avg_total
+            save_path = os.path.join(checkpoint_dir, "best_student_adapter.pth")
+            torch.save({
                 'epoch': epoch + 1,
                 'model_state_dict': student.module.state_dict() if use_dp else student.state_dict(),
                 'loss': best_loss,
-            }
-            torch.save(save_dict, ckpt_path)
+            }, save_path)
+            print(f"⭐ New Best Saved: {save_path}")
+
+        # 2. 每 50 Epoch 定期保存
+        if (epoch + 1) % 20 == 0:
+            periodic_path = os.path.join(checkpoint_dir, f"adapter_epoch_{epoch + 1}.pth")
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': student.module.state_dict() if use_dp else student.state_dict(),
+                'loss': avg_total,
+            }, periodic_path)
+            print(f"💾 Periodic Checkpoint Saved: {periodic_path}")
 
         scheduler.step()
         torch.cuda.empty_cache()
